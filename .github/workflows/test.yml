@@ -1,0 +1,36 @@
+name: Test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies and native core
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-yaml
+          mkdir -p work
+          curl -fL --retry 3 https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz -o work/core.gz
+          echo '386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6  work/core.gz' | sha256sum -c -
+          gzip -dc work/core.gz > work/mihomo
+          chmod 755 work/mihomo
+      - name: Syntax and release manifest
+        run: |
+          for script in mihomo-lite install.sh tests/test_systemd.sh; do bash -n "$script"; done
+          /usr/bin/python3 -c 'import hashlib,json; m=json.load(open("release.json")); assert hashlib.sha256(open("mihomo-lite","rb").read()).hexdigest()==m["sha256"]'
+      - name: Full command and PTY tests with native parser
+        env:
+          MIHOMO_TEST_REAL_CORE: ${{ github.workspace }}/work/mihomo
+        run: /usr/bin/python3 tests/test_local.py
+      - name: Native proxy smoke tests
+        env:
+          MIHOMO_TEST_REAL_CORE: ${{ github.workspace }}/work/mihomo
+        run: /usr/bin/python3 tests/test_native.py
+      - name: Real systemd integration
+        run: sudo env PATH="/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/sbin:/usr/local/bin" GITHUB_ACTIONS=true MIHOMO_TEST_LINUX_CORE="$PWD/work/mihomo" bash tests/test_systemd.sh

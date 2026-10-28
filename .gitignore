@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+._*
+work/
+dist/
+config.yaml
+subscription.yaml
+overrides.yaml
+*.env
+*.log
+

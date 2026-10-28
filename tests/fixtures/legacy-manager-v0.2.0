@@ -1,0 +1,701 @@
+#!/usr/bin/env bash
+# Ubuntu + systemd; management only, never rewrites subscription YAML.
+set -Eeuo pipefail
+umask 077
+export SYSTEMD_PAGER=cat SYSTEMD_COLORS=0
+VERSION=0.2.0
+CONF=/etc/mihomo-lite.env
+DATA=/etc/mihomo-lite
+STATE=/var/lib/mihomo-lite
+BIN=/usr/local/lib/mihomo-lite/mihomo
+SELF=/usr/local/sbin/mihomo-lite
+UNIT=mihomo-lite.service
+TXN= COMMIT=0 WAS_ACTIVE=0 TTY_STATE=
+say() { printf '%s\n' "$*"; }
+die() { say "$*" >&2; exit 1; }
+help_text() {
+  cat <<'EOF'
+mihomo-lite                      打开中文交互菜单（也可使用 menu）
+mihomo-lite init                 安装管理脚本，生成设置文件，不启动代理
+mihomo-lite setup                首次安装向导
+mihomo-lite set-subscription     交互修改订阅地址
+mihomo-lite install              下载核心、订阅、GEO；安装服务和定时器并启动
+mihomo-lite update               更新订阅；有变化才重启，失败保留旧配置
+mihomo-lite update-geo           更新 GEO 数据，校验后重启
+mihomo-lite update-core vX.Y.Z   手动升级到指定核心版本
+mihomo-lite check                校验现有配置
+mihomo-lite start|stop|restart|status|logs|timers
+mihomo-lite timer-on|timer-off   启用/暂停自动更新
+mihomo-lite boot-on|boot-off     启用/关闭代理服务开机自启
+mihomo-lite edit                 编辑下载、镜像等设置
+mihomo-lite downloads            交互设置镜像和下载代理
+设置文件：/etc/mihomo-lite.env；订阅原文：/etc/mihomo-lite/config.yaml
+EOF
+}
+rollback() {
+  local f
+  for f in config.yaml Country.mmdb GeoIP.dat GeoSite.dat ASN.mmdb; do
+    if [[ -f "$TXN/old/$f" ]]; then
+      cp -p "$TXN/old/$f" "$DATA/.$f.restore"
+      mv -f "$DATA/.$f.restore" "$DATA/$f"
+    else
+      rm -f "$DATA/$f"
+    fi
+  done
+  if [[ -f "$TXN/old-core" ]]; then
+    cp -p "$TXN/old-core" "$BIN.restore"; mv -f "$BIN.restore" "$BIN"
+  else
+    rm -f "$BIN"
+  fi
+  if (( WAS_ACTIVE )); then
+    systemctl reset-failed "$UNIT" || true
+    systemctl restart "$UNIT" || say '旧版本恢复后仍无法启动，请检查日志。' >&2
+  else
+    systemctl stop "$UNIT" || true
+  fi
+}
+cleanup() {
+  local result=$?
+  trap - EXIT
+  if [[ -n "$TTY_STATE" ]]; then stty "$TTY_STATE" 2>/dev/null || true; fi
+  if (( COMMIT )); then
+    say '更新未完成，恢复旧配置、数据库和核心。' >&2
+    rollback || true
+    if (( result == 0 )); then result=1; fi
+  fi
+  [[ -z "$TXN" ]] || rm -rf -- "$TXN"
+  exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+init() {
+  install -d -m 700 "$DATA" "$STATE"
+  install -d -m 755 "$(dirname "$BIN")"
+  if [[ "$(readlink -f "$0")" != "$SELF" ]]; then
+    install -m 755 "$0" "$SELF"
+  fi
+  if [[ ! -e "$CONF" ]]; then
+    cat > "$CONF" <<'EOF'
+# Bash 格式，仅 root 可读。订阅链接只会发给订阅服务器，不经 GitHub 镜像。
+SUB_URL=''
+CORE_VERSION='v1.19.33'
+# GitHub 文件下载代理前缀，按顺序尝试，最后直连。
+# 第三方公共服务可用性取决于当地网络，可替换为自建镜像。
+MIRRORS=('https://ghfast.top/' 'https://gh-proxy.com/')
+# 可选：官方 gzip 资源的 SHA256（独立可信渠道获取）。
+# v1.19.33 内置官方哈希；其他版本为空时只做格式/版本检查。
+CORE_SHA256=''
+# 下载统一走直连；填本机 HTTP 代理可让脚本在代理运行后借用它。
+# 即使此代理失败，仍会自动直连重试。
+DOWNLOAD_PROXY=''
+SUB_UA='mihomo'
+SUB_SCHEDULE='*-*-* 00,06,12,18:00:00'
+GEO_SCHEDULE='Sun *-*-* 04:20:00'
+# 自定义 GEO URL 优先级：这里 > 订阅 geox-url > 下方默认数据源。
+MMDB_URL=''
+GEOIP_URL=''
+GEOSITE_URL=''
+ASN_URL=''
+EOF
+    chmod 600 "$CONF"
+  fi
+  say "管理脚本已就绪，设置文件：${CONF}。首次安装可从菜单选择安装向导。"
+}
+
+check_settings_file() {
+  [[ -f "$CONF" ]] || die '请先执行 init。'
+  [[ $(stat -c %u "$CONF") == 0 ]] || die '设置文件必须由 root 拥有。'
+  local mode
+  mode=$(stat -c %a "$CONF")
+  (( (8#$mode & 077) == 0 )) || die '请执行 chmod 600 /etc/mihomo-lite.env'
+  bash -n "$CONF" 2>/dev/null || die '设置文件语法错误，请用 edit 修复。'
+}
+
+load_settings() {
+  check_settings_file
+  # shellcheck source=/dev/null
+  source "$CONF"
+  for c in curl python3 gzip timeout flock systemctl; do
+    command -v "$c" >/dev/null || die "缺少依赖：$c"
+  done
+  python3 -c 'import yaml' 2>/dev/null || die '请安装 python3-yaml。'
+}
+
+# URL passed through a private curl config, not command arguments or logs.
+request() {
+  local url=$1 out=$2 proxy=$3
+  ML_URL="$url" ML_PROXY="$proxy" ML_UA="$SUB_UA" python3 - > "$TXN/curl.conf" <<'PY' || return 1
+import json, os
+for key, env in zip(('url', 'proxy', 'user-agent'), ('ML_URL', 'ML_PROXY', 'ML_UA')):
+    value = os.environ[env]
+    if any(c in value for c in '\r\n\x00'):
+        raise SystemExit('URL/proxy/UA contains a control character')
+    print(key + ' = ' + json.dumps(value, ensure_ascii=False))
+PY
+  [[ -s "$TXN/curl.conf" ]] || return 1
+  curl --disable --config "$TXN/curl.conf" --noproxy '' \
+    --proto '=https' --proto-redir '=https' --location --fail --silent \
+    --connect-timeout 12 --max-time 240 --retry 1 --output "$out" 2>/dev/null \
+    && [[ -s "$out" ]]
+}
+fetch_one() {
+  local url=$1 out=$2
+  if [[ -n "$DOWNLOAD_PROXY" ]] && request "$url" "$out" "$DOWNLOAD_PROXY"; then
+    return 0
+  fi
+  request "$url" "$out" ''
+}
+fetch() {
+  local url=$1 out=$2 kind=${3:-asset} prefix
+  if [[ $kind == asset && $url == https://github.com/* ]]; then
+    for prefix in ${MIRRORS[@]+"${MIRRORS[@]}"}; do
+      [[ $prefix == https://* ]] || die '镜像必须使用 HTTPS。'
+      if fetch_one "${prefix%/}/$url" "$out"; then return 0; fi
+      say '一个镜像下载失败，尝试下一个来源。' >&2
+    done
+  fi
+  fetch_one "$url" "$out" || { say '下载失败（为保护订阅令牌，不显示 URL）。' >&2; return 1; }
+}
+
+stage() {
+  TXN=$(mktemp -d "$STATE/txn.XXXXXXXX")
+  mkdir "$TXN/new" "$TXN/old"
+  cp -a "$DATA/." "$TXN/new/"
+  systemctl is-active --quiet "$UNIT" && WAS_ACTIVE=1 || WAS_ACTIVE=0
+}
+get_core() {
+  local version=$1 arch url checksum=$CORE_SHA256
+  [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die '核心版本格式应为 vX.Y.Z。'
+  case $(uname -m) in
+    x86_64) arch=amd64-compatible ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) die '当前仅支持 x86_64 和 ARM64。' ;;
+  esac
+  if [[ -z "$checksum" && $version == v1.19.33 ]]; then
+    case $arch in
+      amd64-compatible) checksum=386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6 ;;
+      arm64) checksum=ba408b317080ee265c46cb923a50018c1b82cbd708551cdd46a1e3e307396187 ;;
+    esac
+  fi
+  url="https://github.com/MetaCubeX/mihomo/releases/download/$version/mihomo-linux-$arch-$version.gz"
+  fetch "$url" "$TXN/core.gz"
+  if [[ -n "$checksum" ]]; then
+    [[ $checksum =~ ^[[:xdigit:]]{64}$ ]] || die 'CORE_SHA256 格式错误。'
+    printf '%s  %s\n' "$checksum" "$TXN/core.gz" | sha256sum -c - >/dev/null
+  fi
+  gzip -t "$TXN/core.gz"
+  gzip -dc "$TXN/core.gz" > "$TXN/core"
+  chmod 755 "$TXN/core"
+  "$TXN/core" -v > "$TXN/version.txt"
+  grep -Fq " $version " "$TXN/version.txt" || die '下载核心的版本与请求不符。'
+}
+get_geo() {
+  local force=$1 file url
+  # Read YAML only to find asset URLs; no serialization or configuration changes.
+  python3 - "$TXN/new/config.yaml" "$MMDB_URL" "$GEOIP_URL" "$GEOSITE_URL" "$ASN_URL" > "$TXN/assets" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    cfg = yaml.safe_load(f)
+if not isinstance(cfg, dict) or not any(k in cfg for k in ('proxies', 'proxy-providers')):
+    raise SystemExit('订阅必须是含 proxies 或 proxy-providers 的完整 Mihomo 配置。')
+urls = cfg.get('geox-url') or {}
+defaults = [
+    ('Country.mmdb', 'mmdb', 'country.mmdb'),
+    ('GeoIP.dat', 'geoip', 'geoip.dat'),
+    ('GeoSite.dat', 'geosite', 'geosite.dat'),
+    ('ASN.mmdb', 'asn', 'GeoLite2-ASN.mmdb'),
+]
+for (name, key, remote), override in zip(defaults, sys.argv[2:]):
+    fallback = ('https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/' + remote
+                if key != 'asn' else 'https://github.com/xishang0128/geoip/releases/download/latest/' + remote)
+    url = override or urls.get(key) or fallback
+    if not isinstance(url, str) or not url.startswith('https://') or any(c in url for c in '\r\n\t\x00'):
+        raise SystemExit('GEO 地址必须为 HTTPS 且不能含控制字符。')
+    print(name + '\t' + url)
+PY
+  while IFS=$'\t' read -r file url; do
+    if [[ $force == 1 || ! -s "$TXN/new/$file" ]]; then
+      say "下载 $file"
+      fetch "$url" "$TXN/new/$file"
+      python3 - "$TXN/new/$file" <<'PY'
+import sys
+p = sys.argv[1]
+with open(p, 'rb') as f:
+    start = f.read(512).lstrip().lower()
+    f.seek(0, 2)
+    size = f.tell()
+    f.seek(max(0, size - 131072))
+    tail = f.read()
+if size < 1024 or start.startswith((b'<', b'{', b'<!doctype')):
+    raise SystemExit('数据库疑似错误页面或内容不完整')
+if p.endswith('.mmdb') and b'\xab\xcd\xefMaxMind.com' not in tail:
+    raise SystemExit('MMDB 元数据标记缺失')
+PY
+    fi
+  done < "$TXN/assets"
+}
+validate() {
+  local core=$BIN
+  [[ ! -f "$TXN/core" ]] || core="$TXN/core"
+  say '正在校验配置（最多等待 180 秒；Ctrl+C 可中断）。'
+  # Private log may contain node details; never put it into journald automatically.
+  if ! timeout 180 "$core" -t -d "$TXN/new" -f "$TXN/new/config.yaml" > "$STATE/last-check.log" 2>&1; then
+    die "配置校验失败，旧服务未变。详情：$STATE/last-check.log"
+  fi
+}
+healthy() {
+  local i
+  for i in {1..8}; do
+    sleep 1
+    systemctl is-active --quiet "$UNIT" || return 1
+  done
+  # A repeated crash/restart can look active briefly; require zero auto restarts.
+  [[ $(systemctl show "$UNIT" -p NRestarts --value) == 0 ]]
+}
+commit() {
+  local f changed=0
+  for f in config.yaml Country.mmdb GeoIP.dat GeoSite.dat ASN.mmdb; do
+    [[ ! -f "$DATA/$f" ]] || cp -p "$DATA/$f" "$TXN/old/$f"
+    if ! cmp -s "$DATA/$f" "$TXN/new/$f"; then changed=1; fi
+  done
+  [[ ! -f "$BIN" ]] || cp -p "$BIN" "$TXN/old-core"
+  [[ ! -f "$TXN/core" ]] || changed=1
+  if (( ! changed )); then say '内容没有变化。'; return; fi
+  COMMIT=1
+  for f in config.yaml Country.mmdb GeoIP.dat GeoSite.dat ASN.mmdb; do
+    cp -p "$TXN/new/$f" "$DATA/.$f.new"; mv -f "$DATA/.$f.new" "$DATA/$f"
+  done
+  if [[ -f "$TXN/core" ]]; then
+    install -m 755 "$TXN/core" "$BIN.new"; mv -f "$BIN.new" "$BIN"
+  fi
+  if (( WAS_ACTIVE )); then
+    systemctl restart "$UNIT"
+    healthy || die '更新后进程检查失败。'
+  fi
+  COMMIT=0
+  say '更新完成。'
+}
+write_units() {
+  cat > /etc/systemd/system/mihomo-lite.service <<'EOF'
+[Unit]
+Description=Mihomo (mihomo-lite)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+[Service]
+Type=simple
+WorkingDirectory=/etc/mihomo-lite
+ExecStart=/usr/local/lib/mihomo-lite/mihomo -d /etc/mihomo-lite -f /etc/mihomo-lite/config.yaml
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+EOF
+  local job schedule
+  for job in update update-geo; do
+    schedule=$SUB_SCHEDULE
+    [[ $job != update-geo ]] || schedule=$GEO_SCHEDULE
+    [[ $schedule != *$'\n'* && $schedule != *$'\r'* ]] || die '定时表达式不能含换行。'
+    systemd-analyze calendar "$schedule" >/dev/null
+    cat > "/etc/systemd/system/mihomo-lite-$job.service" <<EOF
+[Unit]
+Description=Mihomo maintenance: $job
+Wants=network-online.target
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=$SELF $job
+TimeoutStartSec=45min
+UMask=0077
+EOF
+    cat > "/etc/systemd/system/mihomo-lite-$job.timer" <<EOF
+[Unit]
+Description=Schedule Mihomo $job
+[Timer]
+OnCalendar=$schedule
+Persistent=true
+RandomizedDelaySec=180
+[Install]
+WantedBy=timers.target
+EOF
+  done
+  systemctl daemon-reload
+}
+
+save_setting() (
+  # Lock only the write, never the time spent waiting for keyboard input.
+  exec 8> "$STATE/manager.lock"
+  flock -w 30 8 || die '另一个管理任务正在运行，请稍后重试。'
+  ML_SETTING_VALUE="$2" python3 - "$CONF" "$1" <<'PY'
+import os, re, shlex, subprocess, sys, tempfile
+from urllib.parse import urlsplit
+value = os.environ['ML_SETTING_VALUE']
+path, key = sys.argv[1:]
+if key not in ('SUB_URL', 'MIRRORS', 'DOWNLOAD_PROXY'):
+    raise SystemExit('不支持的设置项')
+if any(ord(c) < 32 or ord(c) == 127 for c in value):
+    raise SystemExit('设置不能含控制字符')
+if key == 'SUB_URL':
+    parsed = urlsplit(value)
+    if parsed.scheme != 'https' or not parsed.hostname or any(c.isspace() for c in value):
+        raise SystemExit('订阅地址必须为有效的 HTTPS URL，且不能含空白。')
+if key == 'MIRRORS':
+    values = value.split()
+    for url in values:
+        if urlsplit(url).scheme != 'https' or not urlsplit(url).hostname:
+            raise SystemExit('每个镜像前缀必须为有效的 HTTPS URL')
+    encoded = '(' + ' '.join(shlex.quote(v) for v in values) + ')'
+else:
+    if key == 'DOWNLOAD_PROXY' and value:
+        parsed = urlsplit(value)
+        if parsed.scheme not in ('http', 'https', 'socks5', 'socks5h') or not parsed.hostname or any(c.isspace() for c in value):
+            raise SystemExit('下载代理必须为有效的 HTTP/HTTPS/SOCKS5 URL')
+    encoded = shlex.quote(value)
+with open(path) as f:
+    lines = f.readlines()
+assignment = key + '=' + encoded + '\n'
+result, found = [], False
+for line in lines:
+    if re.match(r'^\s*(?:export\s+)?' + key + r'=', line):
+        if not found:
+            result.append(assignment)
+            found = True
+    else:
+        result.append(line)
+if not found:
+    if result and not result[-1].endswith('\n'):
+        result[-1] += '\n'
+    result.append(assignment)
+fd, temp = tempfile.mkstemp(prefix='.mihomo-lite-env.', dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, 'w') as f:
+        f.writelines(result)
+        f.flush()
+        os.fsync(f.fileno())
+    if subprocess.run(['bash', '-n', temp], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode:
+        raise SystemExit('设置未保存：请先用 edit 将该设置项整理为单行赋值。')
+    os.replace(temp, path)
+finally:
+    if os.path.exists(temp):
+        os.unlink(temp)
+PY
+)
+
+set_subscription() {
+  local value read_status=0
+  # Disable echo before rendering the prompt, including a fast paste. EXIT also
+  # restores the terminal if a signal interrupts the read or subsequent code.
+  if [[ -t 0 ]]; then
+    TTY_STATE=$(stty -g)
+    stty -echo
+  fi
+  printf '%s' '粘贴完整 HTTPS 订阅地址后按回车（输入隐藏；回车或 0 返回）：'
+  IFS= read -r value || read_status=$?
+  if [[ -n "$TTY_STATE" ]]; then stty "$TTY_STATE"; TTY_STATE=; fi
+  say ''
+  (( read_status == 0 )) || return 10
+  [[ -n "$value" && $value != 0 ]] || return 10
+  save_setting SUB_URL "$value"
+  say '订阅地址已保存。执行“更新订阅”后生效；首次使用请安装服务。'
+}
+
+configure_downloads() {
+  local choice value
+  while true; do
+    cat <<'EOF'
+
+--- 下载设置 ---
+1) 设置 GitHub 下载镜像
+2) 设置脚本下载代理
+0) 返回上一级
+EOF
+    IFS= read -r -p '请选择：' choice || return 10
+    case $choice in
+      0) return 0 ;;
+      1)
+        say '输入 HTTPS 镜像前缀，多个用空格分隔；回车只用官方直连，0 取消：'
+        IFS= read -r value || return 10
+        [[ $value != 0 ]] || continue
+        save_setting MIRRORS "$value"
+        say '镜像设置已保存。'
+        ;;
+      2)
+        say '输入下载代理（例如 http://127.0.0.1:7890；回车清空，0 取消）：'
+        IFS= read -r value || return 10
+        [[ $value != 0 ]] || continue
+        save_setting DOWNLOAD_PROXY "$value"
+        say '下载代理已保存。'
+        ;;
+      *) say '无效选项。' ;;
+    esac
+  done
+}
+
+edit_settings() {
+  local editor
+  # Editor is a single executable name/path; never evaluate it as shell code.
+  editor=${EDITOR:-nano}
+  if ! command -v "$editor" >/dev/null; then editor=vi; fi
+  command -v "$editor" >/dev/null || die '请安装 nano/vi，或用 EDITOR 指定编辑器。'
+  say '即将进入外部编辑器：nano 按 Ctrl+X 退出；vi 按 Esc，再输入 :q 退出。'
+  "$editor" "$CONF"
+  chmod 600 "$CONF"
+  say '设置已保存，下次维护任务读取。定时时间需修改对应 .timer 文件。'
+}
+
+menu_action() {
+  # Separate process: an action failure or rollback cannot exit the menu loop.
+  # Do not hold a manager lock while waiting for user input in the parent.
+  local result
+  if bash "${BASH_SOURCE[0]}" "$@"; then
+    say '操作完成。'
+  else
+    result=$?
+    case $result in
+      10) say '已取消，返回菜单。' ;;
+      130|143) say '操作已中断，返回菜单。' ;;
+      *) say "操作失败（退出码 ${result}），返回菜单；请查看上方提示。" ;;
+    esac
+  fi
+  return 0
+}
+
+# An interrupted prompt returns to its parent; EOF exits without looping.
+menu_read() {
+  local result
+  # Return from the prompt itself: Bash may otherwise resume a read after SIGINT.
+  trap 'trap ":" INT; REPLY=__INTERRUPTED__; printf "\n"; return 0' INT
+  if IFS= read -r -p "$1" REPLY; then
+    trap ':' INT
+    return 0
+  else
+    result=$?
+    trap ':' INT
+    if (( result > 128 )); then REPLY=__INTERRUPTED__; return 0; fi
+    return 1
+  fi
+}
+
+submenu() {
+  local group=$1 version
+  while true; do
+    case $group in
+      service) cat <<'EOF'
+
+--- 服务控制 ---
+1) 启动
+2) 停止
+3) 重启
+4) 开启开机自启
+5) 关闭开机自启（不停止当前服务）
+0) 返回主菜单
+EOF
+        ;;
+      subscription) cat <<'EOF'
+
+--- 订阅管理 ---
+1) 立即更新订阅
+2) 更换订阅地址
+3) 查看定时任务
+0) 返回主菜单
+EOF
+        ;;
+      diagnostics) cat <<'EOF'
+
+--- 日志与诊断 ---
+1) 最近运行日志
+2) 订阅更新日志
+3) GEO 更新日志
+4) 校验当前配置
+0) 返回主菜单
+EOF
+        ;;
+      advanced) cat <<'EOF'
+
+--- 设置与维护 ---
+1) 镜像与下载设置
+2) 更新 GEO 数据库
+3) 升级核心
+4) 自动更新设置
+5) 编辑完整设置文件（高级）
+0) 返回主菜单
+EOF
+        ;;
+      schedule) cat <<'EOF'
+
+--- 自动更新设置 ---
+1) 查看定时任务
+2) 启用订阅/GEO 自动更新
+3) 暂停订阅/GEO 自动更新
+0) 返回上一级（设置与维护）
+EOF
+        ;;
+    esac
+    menu_read '请选择（0 返回）：' || return 0
+    [[ $REPLY != __INTERRUPTED__ ]] || return 0
+    [[ $REPLY != 0 ]] || return 0
+    case "$group:$REPLY" in
+      service:1) menu_action start ;;
+      service:2) menu_action stop ;;
+      service:3) menu_action restart ;;
+      service:4) menu_action boot-on ;;
+      service:5) menu_action boot-off ;;
+      subscription:1) menu_action update ;;
+      subscription:2) menu_action set-subscription ;;
+      subscription:3|schedule:1) menu_action timers ;;
+      diagnostics:1) menu_action recent-logs ;;
+      diagnostics:2) menu_action update-logs ;;
+      diagnostics:3) menu_action geo-logs ;;
+      diagnostics:4) menu_action check ;;
+      advanced:1) menu_action downloads ;;
+      advanced:2) menu_action update-geo ;;
+      advanced:3)
+        menu_read '版本号（例如 v1.19.33；回车或 0 取消）：' || return 0
+        version=$REPLY
+        if [[ -n "$version" && $version != 0 && $version != __INTERRUPTED__ ]]; then menu_action update-core "$version"; fi
+        ;;
+      advanced:4) submenu schedule ;;
+      advanced:5) menu_action edit ;;
+      schedule:2) menu_action timer-on ;;
+      schedule:3) menu_action timer-off ;;
+      *) say '无效选项，请重新选择。' ;;
+    esac
+  done
+}
+
+interactive_menu() {
+  local state first_label first_action
+  # Children retain their own SIGINT trap and rollback; the menu survives Ctrl+C.
+  trap ':' INT
+  while true; do
+    state=$(systemctl is-active "$UNIT" 2>/dev/null || true)
+    first_label='首次安装向导'; first_action=setup
+    if [[ -x "$BIN" && -f "$DATA/config.yaml" ]]; then
+      first_label='查看服务状态'; first_action=status
+    fi
+    cat <<EOF
+
+========== Mihomo 轻量管理 v${VERSION} ==========
+服务状态：${state:-未安装}
+ 1) $first_label
+ 2) 服务控制
+ 3) 订阅管理
+ 4) 日志与诊断
+ 5) 设置与维护
+ 0) 退出
+EOF
+    menu_read '请选择 [0-5]：' || return 0
+    case $REPLY in
+      __INTERRUPTED__) continue ;;
+      0) return 0 ;;
+      1) menu_action "$first_action" ;;
+      2) submenu service ;;
+      3) submenu subscription ;;
+      4) submenu diagnostics ;;
+      5) submenu advanced ;;
+      *) say '无效选项，请输入 0 到 5。' ;;
+    esac
+  done
+}
+
+main() {
+  local cmd=${1:-menu}
+  if [[ $cmd == --version || $cmd == version ]]; then say "$VERSION"; return; fi
+  case $cmd in help|-h|--help) help_text; return;; esac
+  [[ $(uname -s) == Linux ]] || die '此脚本需要 Linux + systemd。'
+  (( EUID == 0 )) || die '请使用 sudo。'
+  [[ -d /run/systemd/system ]] || die '需要运行中的 systemd。'
+  if [[ $cmd == menu ]]; then
+    [[ -t 0 && -t 1 ]] || die '交互菜单需要终端；自动任务请显式使用 update 等子命令。'
+    interactive_menu; return
+  fi
+  if [[ $cmd == setup ]]; then
+    [[ ! -x "$BIN" || ! -f "$DATA/config.yaml" ]] || die '已安装，请选择订阅更新或其他维护操作。'
+    bash "${BASH_SOURCE[0]}" init
+    bash "${BASH_SOURCE[0]}" set-subscription
+    bash "${BASH_SOURCE[0]}" install
+    return
+  fi
+  if [[ $cmd == init ]]; then init; return; fi
+  # Basic service control/diagnostics must work with broken or missing settings.
+  # They never acquire a maintenance lock or require Python/YAML.
+  case $cmd in
+    start|restart) systemctl reset-failed "$UNIT"; systemctl "$cmd" "$UNIT"; return ;;
+    stop) systemctl stop "$UNIT"; return ;;
+    status)
+      local status_code=0
+      systemctl --no-pager status "$UNIT" || status_code=$?
+      if (( status_code != 0 && status_code != 3 )); then return "$status_code"; fi
+      return 0
+      ;;
+    logs) exec journalctl -u "$UNIT" -n 100 -f ;;
+    recent-logs) journalctl -u "$UNIT" -n 100 --no-pager; return ;;
+    update-logs) journalctl -u mihomo-lite-update.service -n 100 --no-pager; return ;;
+    geo-logs) journalctl -u mihomo-lite-update-geo.service -n 100 --no-pager; return ;;
+    timers) systemctl --no-pager list-timers --all 'mihomo-lite-*'; return ;;
+    timer-on) systemctl enable --now mihomo-lite-update.timer mihomo-lite-update-geo.timer; return ;;
+    timer-off) systemctl disable --now mihomo-lite-update.timer mihomo-lite-update-geo.timer; return ;;
+    boot-on) systemctl enable "$UNIT"; return ;;
+    boot-off) systemctl disable "$UNIT"; return ;;
+  esac
+  # Allow settings to be entered before the first install.
+  case $cmd in set-subscription|downloads|edit) [[ -f "$CONF" ]] || init ;; esac
+  if [[ $cmd == edit ]]; then
+    # An editor must remain available even after a settings syntax mistake.
+    install -d -m 700 "$STATE"
+    exec 9> "$STATE/manager.lock"
+    flock -w 30 9 || die '另一个管理任务正在运行，请稍后重试。'
+    edit_settings; return
+  fi
+  case $cmd in
+    set-subscription|downloads)
+      check_settings_file
+      command -v python3 >/dev/null || die '请先安装 python3。'
+      command -v flock >/dev/null || die '请先安装 util-linux。'
+      install -d -m 700 "$STATE"
+      if [[ $cmd == set-subscription ]]; then set_subscription; else configure_downloads; fi
+      return
+      ;;
+  esac
+  load_settings
+  install -d -m 700 "$DATA" "$STATE"
+  # All mutations share one lock; subscription and GEO timers cannot overlap.
+  exec 9> "$STATE/manager.lock"
+  flock -w 30 9 || die '另一个管理任务正在运行，请稍后重试。'
+  case $cmd in
+    install)
+      [[ ! -x "$BIN" || ! -f "$DATA/config.yaml" ]] || die '已安装，请使用 update / update-core。'
+      [[ -n "$SUB_URL" ]] || die "请先填写 $CONF 中的 SUB_URL。"
+      stage; get_core "$CORE_VERSION"
+      fetch "$SUB_URL" "$TXN/new/config.yaml" subscription
+      get_geo 0; validate; write_units; commit
+      # Keep transaction live until the first start succeeds as well.
+      COMMIT=1
+      systemctl start "$UNIT"
+      healthy || die '首次启动失败。'
+      COMMIT=0
+      systemctl enable "$UNIT"
+      systemctl enable --now mihomo-lite-update.timer mihomo-lite-update-geo.timer
+      say '服务和自动更新已启用。'
+      ;;
+    update|update-geo|update-core)
+      [[ -x "$BIN" && -f "$DATA/config.yaml" ]] || die '请先完成 install。'
+      stage
+      case $cmd in
+        update) [[ -n "$SUB_URL" ]] || die 'SUB_URL 为空。'
+          fetch "$SUB_URL" "$TXN/new/config.yaml" subscription; get_geo 0 ;;
+        update-geo) get_geo 1 ;;
+        update-core) get_core "${2:?请指定核心版本 vX.Y.Z}" ;;
+      esac
+      validate; commit
+      ;;
+    check) stage; validate; say '配置校验通过。' ;;
+    *) help_text; exit 1 ;;
+  esac
+}
+main "$@"

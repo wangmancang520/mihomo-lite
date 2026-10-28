@@ -1,0 +1,8 @@
+test_invalid_yaml_rejected (__main__.NativeTests.test_invalid_yaml_rejected) ... ok
+test_real_proxy_forwards_http (__main__.NativeTests.test_real_proxy_forwards_http) ... ok
+test_real_version (__main__.NativeTests.test_real_version) ... ok
+
+----------------------------------------------------------------------
+Ran 3 tests in 0.728s
+
+OK
